@@ -6,7 +6,13 @@ from ddgs import DDGS
 from dotenv import load_dotenv
 from anthropic import Anthropic, APIError, APIConnectionError, AuthenticationError
 
-MODEL = "claude-haiku-4-5"
+import rag
+
+load_dotenv()  # loads CHAT_MODEL_NAME from .env before it's read below; safe to call again if already loaded
+
+MODEL = os.environ["CHAT_MODEL_NAME"]
+
+DOCUMENTS_FOLDER = "./documents"  # drop PDFs here, then run /ingest to index them
 
 COMPACT_THRESHOLD = 10  # once history exceeds this many messages, fold old ones into a summary
 KEEP_RECENT = 4  # always leave this many messages untouched, verbatim
@@ -23,6 +29,8 @@ WHAT YOU HANDLE:
 - General knowledge questions, including time-sensitive ones. Use the web_search tool for
   anything you're not confident is still accurate (current events, prices, versions,
   officeholders, etc.) rather than guessing from training data.
+- Questions about the user's own ingested PDF documents. Use the search_documents tool for
+  these instead of guessing from general knowledge.
 
 WHAT YOU REFUSE:
 - Writing malware, exploits, or code meant to cause harm without clear authorization context.
@@ -56,6 +64,21 @@ WEB_SEARCH_TOOL = {
     },
 }
 
+SEARCH_DOCUMENTS_TOOL = {
+    "name": "search_documents",
+    "description": (
+        "Search the ingested PDF documents for relevant passages. Use this when the user asks "
+        "about content from their own PDFs rather than general knowledge or the live web."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "The search query"},
+        },
+        "required": ["query"],
+    },
+}
+
 
 def web_search(query, max_results=5):
     try:
@@ -67,6 +90,15 @@ def web_search(query, max_results=5):
     return "\n\n".join(
         f"{r.get('title', '')}\n{r.get('href', '')}\n{r.get('body', '')}" for r in results
     )
+
+
+def search_documents(collection, query):
+    if collection is None:
+        return "No documents have been ingested yet. Run /ingest first."
+    try:
+        return rag.query_documents(collection, query)
+    except Exception as e:
+        return f"Document search failed: {e}"
 
 
 def _content_to_text(content):
@@ -121,7 +153,7 @@ def compact_history(history, client, existing_summary):
     return recent, combined_summary
 
 
-def get_assistant_reply(client, history, system_prompt):
+def get_assistant_reply(client, history, system_prompt, collection):
     # loop until Claude returns a final text answer instead of requesting a tool call;
     # appends every intermediate assistant/tool-result turn to `history` as it goes
     while True:
@@ -130,18 +162,24 @@ def get_assistant_reply(client, history, system_prompt):
             max_tokens=1024,
             messages=history,
             system=system_prompt,
-            tools=[WEB_SEARCH_TOOL],
+            tools=[WEB_SEARCH_TOOL, SEARCH_DOCUMENTS_TOOL],
         )
         history.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason != "tool_use":
             return "".join(block.text for block in response.content if block.type == "text")
 
-        tool_results = [
-            {"type": "tool_result", "tool_use_id": block.id, "content": web_search(block.input["query"])}
-            for block in response.content
-            if block.type == "tool_use" and block.name == "web_search"
-        ]
+        tool_results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            if block.name == "web_search":
+                result = web_search(block.input["query"])
+            elif block.name == "search_documents":
+                result = search_documents(collection, block.input["query"])
+            else:
+                continue
+            tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
         history.append({"role": "user", "content": tool_results})
 
 
@@ -155,10 +193,21 @@ def main():
         print("Error: AZURE_API_KEY not found. Make sure it is set in your .env file.")
         sys.exit(1)
 
-    # client bound to Azure's endpoint instead of the default Anthropic API
-    client = Anthropic(base_url=os.getenv("AZURE_BASE_URL"), api_key=os.getenv("AZURE_API_KEY"))
+    # client bound to Azure's endpoint instead of the default Anthropic API; Azure requires
+    # an api-version query param on every request, same as the embedding endpoint in rag.py
+    client = Anthropic(
+        base_url=os.getenv("AZURE_BASE_URL"),
+        api_key=os.getenv("AZURE_API_KEY"),
+        default_query={"api-version": os.environ["AZURE_API_VERSION"]},
+    )
     history = []  # mutable conversation memory: list of {"role", "content"} dicts
     summary = None  # running system-message summary of turns folded out of `history`
+
+    try:
+        collection = rag.get_collection()
+    except Exception as e:
+        print(f"Warning: could not initialize document store ({e}). /ingest and document search will be unavailable.")
+        collection = None
 
     print("Claude command-line chatbot. Type 'exit' or 'quit' to leave.")
 
@@ -196,6 +245,27 @@ def main():
                     print(f"[{msg['role']}] {_content_to_text(msg['content'])}")
             continue
 
+        if command.startswith("/ingest"):
+            if collection is None:
+                print("Document store is unavailable, check the warning printed at startup.")
+                continue
+            parts = user_input.split(maxsplit=1)
+            folder = parts[1] if len(parts) > 1 else DOCUMENTS_FOLDER
+            if not os.path.isdir(folder):
+                print(f"Error: folder not found: {folder}")
+                continue
+            print(f"Ingesting PDFs from {folder} ...")
+            try:
+                num_files, num_chunks = rag.ingest_pdfs(folder, collection)
+            except Exception as e:
+                print(f"Ingestion failed: {e}")
+                continue
+            if num_files == 0:
+                print(f"No PDF files found in {folder}.")
+            else:
+                print(f"Ingested {num_chunks} chunks from {num_files} PDF file(s).")
+            continue
+
         # --- history/state management: record the user's turn before calling the API ---
         history.append({"role": "user", "content": user_input})
         rollback_point = len(history) - 1  # discard this whole turn (incl. any tool round-trips) on failure
@@ -206,7 +276,7 @@ def main():
 
         # --- API call wrapper (may loop internally for tool_use round-trips) ---
         try:
-            reply_text = get_assistant_reply(client, history, system_prompt)
+            reply_text = get_assistant_reply(client, history, system_prompt, collection)
         except AuthenticationError:
             print("Error: authentication failed. Check that your API key is valid.")
             del history[rollback_point:]  # roll back the orphaned turn so history stays valid

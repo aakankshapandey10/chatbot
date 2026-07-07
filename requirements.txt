@@ -1,0 +1,6 @@
+anthropic
+ddgs
+python-dotenv
+chromadb
+pypdf
+requests
